@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS settlements (
     total_delta  REAL NOT NULL,
     content_hash TEXT NOT NULL,
     operator     TEXT,
+    reversed_by  TEXT,
     created_at   TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS settlement_items (
@@ -81,11 +82,40 @@ CREATE TABLE IF NOT EXISTS settlement_items (
     prev_settled_id TEXT,
     prev_fee        REAL,
     delta           REAL NOT NULL,
-    created_at      TEXT NOT NULL,
-    UNIQUE(root_id, assessment_id)
+    created_at      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_settlement_items_root
     ON settlement_items(root_id);
+CREATE INDEX IF NOT EXISTS idx_settlement_items_settlement
+    ON settlement_items(settlement_id);
+CREATE TABLE IF NOT EXISTS reversals (
+    id            TEXT PRIMARY KEY,
+    request_id    TEXT NOT NULL UNIQUE,
+    settlement_id TEXT NOT NULL,
+    region        TEXT NOT NULL,
+    currency      TEXT NOT NULL,
+    total_delta   REAL NOT NULL,
+    reason        TEXT NOT NULL,
+    operator      TEXT,
+    content_hash  TEXT NOT NULL,
+    created_at    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reversal_items (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    reversal_id   TEXT NOT NULL,
+    settlement_id TEXT NOT NULL,
+    root_id       TEXT NOT NULL,
+    assessment_id TEXT NOT NULL,
+    version       INTEGER NOT NULL,
+    original_fee  REAL NOT NULL,
+    source_delta  REAL NOT NULL,
+    delta         REAL NOT NULL,
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reversal_items_root
+    ON reversal_items(root_id);
+CREATE INDEX IF NOT EXISTS idx_reversal_items_reversal
+    ON reversal_items(reversal_id);
 """
 
 
@@ -149,6 +179,50 @@ class Store:
             " WHERE resub_source_chain_id IS NOT NULL")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_assessments_resub_root"
                      " ON assessments(resub_root_id)")
+        # 冲正：结算单补 reversed_by 关联列（未冲正为 NULL）
+        set_cols = {r[1] for r in conn.execute("PRAGMA table_info(settlements)")}
+        if "reversed_by" not in set_cols:
+            conn.execute("ALTER TABLE settlements ADD COLUMN reversed_by TEXT")
+        # 旧库的 settlement_items 带 UNIQUE(root_id, assessment_id)：
+        # 冲正允许原版本重新结算，该约束不再成立，重建表改为普通索引。
+        # 建表附带的唯一约束体现为 sqlite_autoindex（无法 DROP INDEX），
+        # 因此存在任何唯一索引时都整体重建该表（DROP TABLE 会连带删除）。
+        idx_rows = conn.execute("PRAGMA index_list(settlement_items)").fetchall()
+        named_unique = [r[1] for r in idx_rows if r[2] == 1
+                        and not r[1].startswith("sqlite_autoindex")]
+        if any(r[2] == 1 for r in idx_rows):
+            for name in named_unique:
+                conn.execute(f"DROP INDEX {name}")
+            conn.execute(
+                "CREATE TABLE settlement_items_new ("
+                "  id              INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "  settlement_id   TEXT NOT NULL,"
+                "  root_id         TEXT NOT NULL,"
+                "  assessment_id   TEXT NOT NULL,"
+                "  version         INTEGER NOT NULL,"
+                "  original_fee    REAL NOT NULL,"
+                "  prev_settled_id TEXT,"
+                "  prev_fee        REAL,"
+                "  delta           REAL NOT NULL,"
+                "  created_at      TEXT NOT NULL)")
+            conn.execute(
+                "INSERT INTO settlement_items_new (id, settlement_id, root_id,"
+                " assessment_id, version, original_fee, prev_settled_id,"
+                " prev_fee, delta, created_at)"
+                " SELECT id, settlement_id, root_id, assessment_id, version,"
+                " original_fee, prev_settled_id, prev_fee, delta, created_at"
+                " FROM settlement_items")
+            conn.execute("DROP TABLE settlement_items")
+            conn.execute("ALTER TABLE settlement_items_new"
+                         " RENAME TO settlement_items")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_settlement_items_root"
+                     " ON settlement_items(root_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_settlement_items_settlement"
+                     " ON settlement_items(settlement_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_reversal_items_root"
+                     " ON reversal_items(root_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_reversal_items_reversal"
+                     " ON reversal_items(reversal_id)")
 
     # ------------------------------------------------------------------ 基础
     def _conn(self) -> sqlite3.Connection:
@@ -618,12 +692,15 @@ class Store:
             (sid,)).fetchall()
         return {
             "id": row["id"],
+            "kind": "settlement",
             "request_id": row["request_id"],
             "region": row["region"],
             "currency": row["currency"],
             "total_delta": row["total_delta"],
             "operator": row["operator"],
             "created_at": row["created_at"],
+            "status": "reversed" if row["reversed_by"] else "active",
+            "reversed_by": row["reversed_by"],
             "items": [{
                 "root_id": it["root_id"],
                 "assessment_id": it["assessment_id"],
@@ -640,26 +717,37 @@ class Store:
             return self._fetch_settlement(conn, sid)
 
     def list_settlements(self, region: str | None = None, limit: int = 50,
-                         offset: int = 0) -> list[dict]:
+                         offset: int = 0,
+                         status: str | None = None) -> list[dict]:
         sql = ("SELECT s.*, (SELECT COUNT(*) FROM settlement_items i"
                "              WHERE i.settlement_id = s.id) AS item_count"
                " FROM settlements s")
         params: list[Any] = []
+        conds: list[str] = []
         if region:
-            sql += " WHERE s.region=?"
+            conds.append("s.region=?")
             params.append(region)
-        sql += " ORDER BY s.created_at DESC, s.id DESC LIMIT ? OFFSET ?"
+        if status == "active":
+            conds.append("s.reversed_by IS NULL")
+        elif status == "reversed":
+            conds.append("s.reversed_by IS NOT NULL")
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        sql += " ORDER BY s.created_at DESC, s.rowid DESC LIMIT ? OFFSET ?"
         params += [limit, offset]
         with self._locked_conn() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [{
             "id": r["id"],
+            "kind": "settlement",
             "request_id": r["request_id"],
             "region": r["region"],
             "currency": r["currency"],
             "total_delta": r["total_delta"],
             "operator": r["operator"],
             "created_at": r["created_at"],
+            "status": "reversed" if r["reversed_by"] else "active",
+            "reversed_by": r["reversed_by"],
             "item_count": r["item_count"],
         } for r in rows]
 
@@ -671,8 +759,10 @@ class Store:
 
         返回 (结算单, 是否新建, 错误)；错误为 {"status": int, "errors": [...]}。
         幂等：request_id 已存在且内容指纹一致时返回原结算单（不新建、
-        不重复入账）；内容不一致时报 409 冲突。同一链同一版本由
-        UNIQUE(root_id, assessment_id) 兜底，只会入账一次。"""
+        不重复入账）；内容不一致时报 409 冲突。
+        差额基线取该链**最近一笔未被冲正**的结算项（冲正后原版本可重新
+        结算，基线可能为空即从零起算）；进程级写锁内复核同一链同一版本
+        不会重复入账。请求号在结算与冲正之间互不通用。"""
         with self._locked_conn() as conn:
             dup = conn.execute(
                 "SELECT id, content_hash FROM settlements WHERE request_id=?",
@@ -684,6 +774,12 @@ class Store:
                     409, "request_id",
                     f"幂等请求号 {request_id} 已用于不同的结算内容，"
                     f"请更换请求号后重试")
+            if conn.execute("SELECT 1 FROM reversals WHERE request_id=? LIMIT 1",
+                            (request_id,)).fetchone():
+                return None, False, _fail(
+                    409, "request_id",
+                    f"幂等请求号 {request_id} 已用于结算冲正，"
+                    f"结算与冲正的请求号不可混用")
             items: list[dict] = []
             currency: str | None = None
             for aid in assessment_ids:
@@ -713,15 +809,21 @@ class Store:
                         f"币种不一致：单号 {aid} 的币种为 {row['currency']}，"
                         f"与本次结算币种 {currency} 不同")
                 root_id = row["root_id"] or row["id"]
+                # 差额基线：最近一笔未被冲正的结算项（按入账先后）；
+                # 已被冲正的结算项不作为基线，如同其从未入账。
                 prev = conn.execute(
-                    "SELECT assessment_id, original_fee FROM settlement_items"
-                    " WHERE root_id=? ORDER BY version DESC, id DESC LIMIT 1",
+                    "SELECT si.assessment_id AS assessment_id,"
+                    "       si.original_fee AS original_fee"
+                    " FROM settlement_items si JOIN settlements s"
+                    " ON si.settlement_id = s.id"
+                    " WHERE si.root_id=? AND s.reversed_by IS NULL"
+                    " ORDER BY si.id DESC LIMIT 1",
                     (root_id,)).fetchone()
                 if prev and prev["assessment_id"] == aid:
                     return None, False, _fail(
                         409, "assessment_ids",
-                        f"修订链 {root_id} 的当前版本 {aid} 已结算，"
-                        f"无新增可结金额")
+                        f"修订链 {root_id} 的当前版本 {aid} 已结算"
+                        f"（结算单仍有效），无新增可结金额")
                 prev_fee = prev["original_fee"] if prev else None
                 delta = _money(row["total_fee"] - (prev_fee or 0.0))
                 items.append({
@@ -752,6 +854,183 @@ class Store:
                      it["original_fee"], it["prev_settled_id"], it["prev_fee"],
                      it["delta"], now))
         return self.get_settlement(sid), True, None
+
+    # ---------------------------------------------------------------- 结算冲正
+    def _fetch_reversal(self, conn: sqlite3.Connection,
+                        rid: str) -> dict | None:
+        row = conn.execute("SELECT * FROM reversals WHERE id=?",
+                           (rid,)).fetchone()
+        if not row:
+            return None
+        items = conn.execute(
+            "SELECT * FROM reversal_items WHERE reversal_id=? ORDER BY id",
+            (rid,)).fetchall()
+        return {
+            "id": row["id"],
+            "kind": "reversal",
+            "request_id": row["request_id"],
+            "settlement_id": row["settlement_id"],
+            "region": row["region"],
+            "currency": row["currency"],
+            "total_delta": row["total_delta"],
+            "reason": row["reason"],
+            "operator": row["operator"],
+            "created_at": row["created_at"],
+            "items": [{
+                "root_id": it["root_id"],
+                "assessment_id": it["assessment_id"],
+                "version": it["version"],
+                "original_fee": it["original_fee"],
+                "source_settlement_id": it["settlement_id"],
+                "source_delta": it["source_delta"],
+                "delta": it["delta"],
+            } for it in items],
+        }
+
+    def get_reversal(self, rid: str) -> dict | None:
+        with self._locked_conn() as conn:
+            return self._fetch_reversal(conn, rid)
+
+    def get_reversal_of_settlement(self, settlement_id: str) -> dict | None:
+        """按原结算单号查询其冲正记录；未冲正或单号不存在时返回 None。"""
+        with self._locked_conn() as conn:
+            row = conn.execute(
+                "SELECT id FROM reversals WHERE settlement_id=?",
+                (settlement_id,)).fetchone()
+            return self._fetch_reversal(conn, row["id"]) if row else None
+
+    def list_reversals(self, region: str | None = None, limit: int = 50,
+                       offset: int = 0) -> list[dict]:
+        sql = ("SELECT r.*, (SELECT COUNT(*) FROM reversal_items i"
+               "              WHERE i.reversal_id = r.id) AS item_count"
+               " FROM reversals r")
+        params: list[Any] = []
+        if region:
+            sql += " WHERE r.region=?"
+            params.append(region)
+        sql += " ORDER BY r.created_at DESC, r.rowid DESC LIMIT ? OFFSET ?"
+        params += [limit, offset]
+        with self._locked_conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [{
+            "id": r["id"],
+            "kind": "reversal",
+            "request_id": r["request_id"],
+            "settlement_id": r["settlement_id"],
+            "region": r["region"],
+            "currency": r["currency"],
+            "total_delta": r["total_delta"],
+            "reason": r["reason"],
+            "operator": r["operator"],
+            "created_at": r["created_at"],
+            "item_count": r["item_count"],
+        } for r in rows]
+
+    def create_reversal(self, *, settlement_id: str, request_id: str,
+                        reason: str, operator: str | None, content_hash: str
+                        ) -> tuple[dict | None, bool, dict | None]:
+        """冲正整张结算单：单个持锁事务内核对受阻链并写入反向记录。
+
+        冲正生成关联原单、逐项金额相反的**独立记录**，原结算单、明细及
+        既有审计保持原样（仅在原单补记 reversed_by 关联）。原单涉及的
+        每条修订链若存在更晚的有效（未被冲正）结算，则整单拒绝并列出
+        全部受阻链；只有全部链都没有更晚结算时才可冲正。
+        幂等：request_id 已存在且内容一致时返回原冲正（200 重试语义由
+        调用层映射）；内容不同 409。请求号在结算与冲正之间互不通用。
+        返回 (冲正单, 是否新建, 错误)。"""
+        with self._locked_conn() as conn:
+            dup = conn.execute(
+                "SELECT id, content_hash FROM reversals WHERE request_id=?",
+                (request_id,)).fetchone()
+            if dup:
+                if dup["content_hash"] == content_hash:
+                    return self._fetch_reversal(conn, dup["id"]), False, None
+                return None, False, _fail(
+                    409, "request_id",
+                    f"幂等请求号 {request_id} 已用于不同的冲正内容，"
+                    f"请更换请求号后重试")
+            bill = conn.execute(
+                "SELECT * FROM settlements WHERE id=?",
+                (settlement_id,)).fetchone()
+            if not bill:
+                return None, False, _fail(
+                    404, "settlement_id",
+                    f"结算单不存在：{settlement_id}")
+            if conn.execute("SELECT 1 FROM settlements WHERE request_id=?"
+                            " LIMIT 1", (request_id,)).fetchone():
+                return None, False, _fail(
+                    409, "request_id",
+                    f"幂等请求号 {request_id} 已用于结算，"
+                    f"结算与冲正的请求号不可混用")
+            if bill["reversed_by"]:
+                prior = self._fetch_reversal(conn, bill["reversed_by"])
+                return None, False, _fail(
+                    409, "settlement_id",
+                    f"结算单 {settlement_id} 已被冲正单 "
+                    f"{bill['reversed_by']} 冲正，不能重复冲正；"
+                    f"同一结算单只允许冲正一次")
+            items = conn.execute(
+                "SELECT * FROM settlement_items WHERE settlement_id=?"
+                " ORDER BY id", (settlement_id,)).fetchall()
+            # 受阻判定：原单每条链不得存在入账更晚且仍有效的结算项。
+            # 已冲正结算的反向项不算“更晚结算”，因此按冲正逆序冲正即可。
+            blocked: list[dict] = []
+            roots: list[str] = []
+            for it in items:
+                root_id = it["root_id"]
+                if root_id in roots:
+                    continue
+                roots.append(root_id)
+                later = conn.execute(
+                    "SELECT si.id AS item_id, si.assessment_id AS assessment_id,"
+                    "       si.settlement_id AS settlement_id"
+                    " FROM settlement_items si JOIN settlements s"
+                    " ON si.settlement_id = s.id"
+                    " WHERE si.root_id=? AND si.id>? AND s.reversed_by IS NULL"
+                    " ORDER BY si.id LIMIT 1",
+                    (root_id, it["id"])).fetchone()
+                if later:
+                    blocked.append({
+                        "root_id": root_id,
+                        "settlement_id": later["settlement_id"],
+                        "assessment_id": later["assessment_id"],
+                    })
+            if blocked:
+                chains = "；".join(
+                    f"修订链 {b['root_id']} 已有更晚结算 {b['settlement_id']}"
+                    f"（版本单号 {b['assessment_id']}）" for b in blocked)
+                return None, False, {
+                    "status": 409,
+                    "errors": [{
+                        "field": "settlement_id",
+                        "message": f"结算单 {settlement_id} 不可冲正：{chains}。"
+                                   f"请先冲正更晚的结算单后再冲正本单",
+                        "blocked_chains": blocked,
+                    }],
+                }
+            rid = "R" + uuid.uuid4().hex[:10].upper()
+            now = _now()
+            total = _money(sum(-it["delta"] for it in items))
+            conn.execute(
+                "INSERT INTO reversals (id, request_id, settlement_id, region,"
+                " currency, total_delta, reason, operator, content_hash,"
+                " created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (rid, request_id, settlement_id, bill["region"],
+                 bill["currency"], total, reason, operator, content_hash, now))
+            for it in items:
+                conn.execute(
+                    "INSERT INTO reversal_items (reversal_id, settlement_id,"
+                    " root_id, assessment_id, version, original_fee,"
+                    " source_delta, delta, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?)",
+                    (rid, settlement_id, it["root_id"], it["assessment_id"],
+                     it["version"], it["original_fee"], it["delta"],
+                     _money(-it["delta"]), now))
+            # 仅补记关联指针，不改动金额与明细；原审计保持原样
+            conn.execute("UPDATE settlements SET reversed_by=? WHERE id=?",
+                         (rid, settlement_id))
+        return self.get_reversal(rid), True, None
 
     # ---------------------------------------------------------------- 审计
     def add_audit(self, actor: str | None, action: str, entity: str,

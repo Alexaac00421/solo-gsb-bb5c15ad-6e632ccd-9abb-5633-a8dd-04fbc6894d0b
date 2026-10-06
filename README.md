@@ -11,7 +11,8 @@
 - **判定复核**：质检员可对已出具的判定单选择同区域另一规则版本做只读复核：以原单保存的批次重量与物料明细按目标版本重新校验、计算，返回原结论与目标等级、扣费明细与差异项；不写单据、不产生修订与审计
 - **拒收复投**：被拒收的来料返工后可重新进场。操作员凭当前有效（链尾）且结论为“拒收”的判定单提交新批次编号、复投重量、物料污染量与操作者；系统沿用来源区域，按提交时该区域的启用规则出具**独立判定单**，记录来源链与复投轮次，旧判定与已生成结算单保持原样。每条被拒收链最多一次直接复投；复投仍被拒收时可凭新链尾继续下一轮；从任一轮可查完整复投谱系与最新轮
 - **费用结算**：操作员提交区域、当前有效（链尾）单号列表与幂等请求号，系统核对单号区域、币种与修订链状态后，在同一事务内冻结各链本次应结金额（与该链上次已结算版本的扣费差额，可为负）、来源版本与合计，生成不可修改的结算单并留审计；同一请求号重试安全，同一链同一版本只会入账一次
-- **持久化与审计**：判定单、规则版本、结算单、审计日志存于 SQLite；判定创建、修订（含原因与操作者）、规则新增/切换、结算生成均留痕
+- **结算冲正（红冲）**：结算单选错批次时，财务可凭**原结算单号、唯一请求号、原因与操作者**冲正整单。冲正生成**关联原单、逐项金额相反的独立记录**（冲正单 `R…`），原结算单、明细及既有审计保持原样。仅当原单涉及的每条修订链都**没有更晚的有效结算**时才可冲正，否则整单拒绝并在 `blocked_chains` 指出受阻链（须按冲正逆序冲正）。同一请求号与相同内容重试返回同一冲正结果；内容不同或换号重复冲正一律拒绝，不重复入账。冲正后再结算以各链**冲正前上一笔有效结算**为差额基线、无则从零起算，并允许原版本重新结算
+- **持久化与审计**：判定单、规则版本、结算单、结算冲正单、审计日志存于 SQLite；判定创建、修订（含原因与操作者）、规则新增/切换、结算生成、结算冲正（含原因与操作者）均留痕
 - **页面与 API**：简洁 Web 页面（`/`）+ REST API（交互文档 `/docs`）+ CSV 导出
 
 ## 快速开始
@@ -60,8 +61,11 @@ pytest tests/ -q
 | GET | `/api/assessments/{id}/resubmissions` | 查询完整复投谱系（各轮链）与最新轮 |
 | POST | `/api/assessments/{id}/review` | 复核判定单（按同区域目标规则版本重算对比，只读） |
 | POST | `/api/settlements` | 结算所选修订链当前版本扣费，生成可追溯结算单（幂等） |
-| GET | `/api/settlements` | 查询结算单列表（`region` / `limit` / `offset`） |
-| GET | `/api/settlements/{id}` | 结算单详情（来源单号、原扣费、差额与合计） |
+| GET | `/api/settlements` | 查询结算单列表（`region` / `status=active|reversed` / `limit` / `offset`） |
+| GET | `/api/settlements/{id}` | 结算单详情（来源单号、原扣费、差额、合计、冲正状态与冲正单关联） |
+| POST | `/api/settlements/{id}/reversal` | 冲正整张结算单（独立反向记录，幂等；受阻链整单拒绝） |
+| GET | `/api/reversals` | 查询冲正单列表（`region` / `limit` / `offset`） |
+| GET | `/api/reversals/{id}` | 冲正单详情（原结算单关联、逐项来源金额与相反金额、原因与操作者） |
 | GET | `/api/rules` | 列出全部规则版本 |
 | GET | `/api/rules/{region}/active` | 查询区域当前启用规则 |
 | POST | `/api/rules` | 新增规则版本（`activate: true` 可同时启用） |
@@ -422,6 +426,95 @@ curl http://localhost:8000/api/assessments/AC001122334/resubmissions
 请求成功）；复投重量/物料不通过现有字段校验时返回 `422`。复投单自身是
 独立判定链，可照常修订与结算；复投不影响来源链已生成的结算单。
 
+### 10. 结算冲正（选错批次整单红冲）
+
+结算单选错批次时，财务凭**原结算单号（路径参数）、唯一请求号、冲正原因
+与操作者**冲正整单。系统在单个持锁事务内核对原单涉及的每条修订链都没有
+更晚的有效结算后，生成**关联原单、逐项金额相反的独立冲正记录**；原结算单、
+明细及既有审计保持原样（原单仅补记 `status` / `reversed_by` 关联）。
+
+```bash
+# 假设原结算单号为 S7E8F9A0B12（合计 8.4）
+curl -X POST http://localhost:8000/api/settlements/S7E8F9A0B12/reversal \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "request_id": "REQ-20261006-REV-001",
+    "reason": "结算时选错批次，整单冲正",
+    "operator": "财务-钱七"
+  }'
+```
+
+响应 `201`：冲正单 `R…` 独立可查，逐项复制原单的来源版本与原扣费，
+并将各项金额取反；合计为原单合计的相反数。
+
+```json
+{
+  "id": "R2CC82C0558",
+  "kind": "reversal",
+  "request_id": "REQ-20261006-REV-001",
+  "settlement_id": "S7E8F9A0B12",
+  "region": "default",
+  "currency": "CNY",
+  "total_delta": -8.4,
+  "reason": "结算时选错批次，整单冲正",
+  "operator": "财务-钱七",
+  "items": [
+    {"root_id": "A0F9F9D8876", "assessment_id": "A0F9F9D8876", "version": 1,
+     "original_fee": 3.6, "source_settlement_id": "S7E8F9A0B12",
+     "source_delta": 3.6, "delta": -3.6}
+  ]
+}
+```
+
+原结算单的金额与明细永不改变，仅状态变为已冲正并附冲正单关联
+（`GET /api/settlements/S7E8F9A0B12`）：
+
+```json
+{"id": "S7E8F9A0B12", "kind": "settlement", "total_delta": 8.4,
+ "status": "reversed", "reversed_by": "R2CC82C0558", "items": [/* 原样保留 */]}
+```
+
+**幂等与重复冲正**：
+
+```bash
+# 同一请求号 + 相同内容（原单号/原因/操作者）重试 → 200，返回同一冲正单，
+#   不重复入账、不重复审计
+curl -X POST http://localhost:8000/api/settlements/S7E8F9A0B12/reversal \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"REQ-20261006-REV-001","reason":"结算时选错批次，整单冲正","operator":"财务-钱七"}'
+# 同一请求号但内容不同（如换原因）→ 409
+# 换新请求号对已冲正结算单再次冲正   → 409（同一结算单只允许冲正一次）
+# 结算与冲正的请求号互不通用，跨用途复用 → 409
+```
+
+**受阻链整单拒绝**：原单涉及的每条修订链若存在**入账更晚且仍有效
+（未被冲正）**的结算，本单不能冲正，响应 `409` 并在 `blocked_chains`
+中列出全部受阻链及更晚结算单；须先冲正更晚的结算单（按冲正逆序）：
+
+```json
+{"errors": [{"field": "settlement_id",
+  "message": "结算单 S1B9AA9A96E 不可冲正：修订链 ACF6C431FF6 已有更晚结算 SCF7508ECA2（版本单号 AD9C91DF4D6）。请先冲正更晚的结算单后再冲正本单",
+  "blocked_chains": [{"root_id": "ACF6C431FF6",
+                      "settlement_id": "SCF7508ECA2",
+                      "assessment_id": "AD9C91DF4D6"}]}]}
+```
+
+**冲正后再结算**：差额基线只统计各链**未被冲正**的最近一笔结算
+——已被冲正的结算视为从未入账；因此没有更早有效结算时从零起算全额，
+且**允许原版本重新结算**（同版本在原单冲正后可再次入账）：
+
+```bash
+# 冲正后以同一链尾重新结算：prev_settled_id=null、prev_fee=null、delta=全额
+curl -X POST http://localhost:8000/api/settlements -H 'Content-Type: application/json' \
+  -d '{"region":"default","assessment_ids":["A0F9F9D8876"],
+       "request_id":"REQ-20261006-RESETTLE-001","operator":"财务-钱七"}'
+```
+
+**查询**：结算单列表支持 `status=active|reversed` 过滤并始终带
+`status` / `reversed_by`；冲正单通过 `/api/reversals` 列表与
+`/api/reversals/{id}` 详情查询。成功冲正写入一条审计
+`settlement.reversed`（原单的 `settlement.created` 审计保持原样）。
+
 ## 费用结算设计
 
 - 结算单（`settlements`）与结算明细（`settlement_items`）只增不改：
@@ -442,6 +535,43 @@ curl http://localhost:8000/api/assessments/AC001122334/resubmissions
 - 结算成功写入审计 `settlement.created`（操作者、请求号、区域、币种、
   合计与各链差额）；任何校验失败、冲突都不产生结算单与审计记录，
   且失败不占用请求号，修正后可重新提交。
+
+## 结算冲正设计
+
+- 冲正**不修改任何金额**：冲正写入独立的 `reversals` / `reversal_items`
+  记录，逐项复制原单的来源版本（`root_id` / `assessment_id` / `version` /
+  `original_fee`）并把金额取反（`delta = -source_delta`），合计为原单
+  合计的相反数；原结算单只补记 `reversed_by` 关联指针，原明细与既有审计
+  原样保留。
+- **受阻判定（整单拒绝）**：以原单各明细的入账序号（`settlement_items.id`）
+  为准，原单涉及的每条修订链只要存在**序号更大且所属结算单未被冲正**的
+  结算项，即视为受阻；响应一次性列出全部受阻链（`blocked_chains`，含更晚
+  结算单号与版本单号）。因此多笔相关结算须按入账逆序冲正；更晚单已冲正后
+  不再构成阻碍。
+- **幂等**：冲正也有独立 `request_id` 唯一约束与内容指纹
+  （原结算单号 + 原因 + 操作者）。同号同内容重试返回原冲正单（`200`）、
+  不重复入账与审计；同号不同内容 `409`；结算与冲正的请求号全局互不通用。
+  已冲正结算单换新号再次冲正同样 `409`，保证一张结算单最多一条冲正。
+- **再结算基线**：结算差额基线的查询只连接**未被冲正**的结算单
+  （`settlements.reversed_by IS NULL`），故冲正项在差额链路上等价于
+  “从未入账”：无有效基线时从零起算，允许**原版本重新结算**（因此旧的
+  `UNIQUE(root_id, assessment_id)` 已移除，同一版本是否已入账由持锁事务内
+  查询实时判定，进程级写锁保证并发下不会重复入账）。
+- **并发一致性**：冲正与结算共用同一把进程级写锁，所有“核对 + 写入 +
+  状态翻转”在单个持锁事务内完成；并发冲正同一张单恰好一个成功（`201`），
+  其余收到 `409`；冲正与再结算并发时结果等价于某一种串行顺序，账目始终
+  自洽、绝不重复入账。
+- **查询兼容**：结算单列表/详情在既有字段之后追加 `kind` / `status`
+  （`active` / `reversed`）/ `reversed_by`，既有字段（`total_delta`、
+  `items[*].delta`、`request_id` 等）含义与取值不变；列表新增
+  `status=active|reversed` 可选过滤。冲正单通过独立的 `/api/reversals`
+  系列接口查询。
+- 冲正成功写入审计 `settlement.reversed`（操作者、冲正请求号、原结算单号、
+  原因、币种、冲正合计与逐项相反金额）；任何失败整笔拒绝、不写冲正记录或
+  审计，也不占用请求号。
+- 旧版数据库在启动时自动迁移：`settlements` 补 `reversed_by` 列；带旧
+  `UNIQUE(root_id, assessment_id)` 约束的 `settlement_items` 自动重建为
+  普通索引表（数据保留），并创建冲正两表。
 
 ## 拒收复投设计
 
@@ -510,9 +640,9 @@ curl http://localhost:8000/api/assessments/AC001122334/resubmissions
 app/
   main.py            # FastAPI 入口：API 路由、错误处理、CSV 导出
   rules.py           # 规则引擎：种子规则、提交校验、判定计算
-  storage.py         # SQLite 持久化：判定单（含修订链/复投谱系）/ 规则版本 / 结算单 / 审计日志
+  storage.py         # SQLite 持久化：判定单（含修订链/复投谱系）/ 规则版本 / 结算单 / 结算冲正 / 审计日志
   static/index.html  # 单文件 Web 页面
-tests/test_api.py    # 73 个接口、版本化、修订、复核、结算与拒收复投行为测试
+tests/test_api.py    # 91 个接口、版本化、修订、复核、结算、拒收复投与结算冲正行为测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

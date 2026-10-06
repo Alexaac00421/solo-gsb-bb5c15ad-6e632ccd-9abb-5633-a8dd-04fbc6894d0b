@@ -87,6 +87,13 @@ class SettlementIn(BaseModel):
     operator: str | None = Field(default=None, max_length=32)
 
 
+class ReversalIn(BaseModel):
+    """结算冲正：原结算单号、唯一幂等请求号、冲正原因与操作者。"""
+    request_id: str = Field(min_length=1, max_length=64)
+    reason: str = Field(min_length=1, max_length=200)
+    operator: str = Field(min_length=1, max_length=32)
+
+
 # ------------------------------------------------------------------ 错误处理
 def _err(errors: list[dict], status: int = 422) -> JSONResponse:
     return JSONResponse(status_code=status, content={"errors": errors})
@@ -475,6 +482,16 @@ def _settlement_hash(region: str, assessment_ids: list[str],
     ).hexdigest()
 
 
+def _reversal_hash(settlement_id: str, reason: str,
+                   operator: str | None) -> str:
+    """冲正请求内容指纹：原结算单号、原因、操作者任一不同即视为不同内容。"""
+    canon = {"settlement_id": settlement_id, "reason": reason,
+             "operator": operator}
+    return hashlib.sha256(
+        json.dumps(canon, ensure_ascii=False, sort_keys=True).encode()
+    ).hexdigest()
+
+
 @app.post("/api/settlements", status_code=201)
 def create_settlement(payload: SettlementIn, store: Store = Depends(get_store)):
     """将所选修订链当前有效版本的扣费结成可追溯账单。
@@ -510,18 +527,79 @@ def create_settlement(payload: SettlementIn, store: Store = Depends(get_store)):
 
 
 @app.get("/api/settlements")
-def list_settlements(region: str | None = None, limit: int = 50, offset: int = 0,
+def list_settlements(region: str | None = None, status: str | None = None,
+                     limit: int = 50, offset: int = 0,
                      store: Store = Depends(get_store)):
+    """结算单列表：可按区域与状态（active 有效 / reversed 已冲正）过滤。"""
+    if status not in (None, "active", "reversed"):
+        return _err([{"field": "status",
+                      "message": "status 仅支持 active 或 reversed"}])
     limit = max(1, min(limit, 500))
-    return {"items": store.list_settlements(region, limit, offset)}
+    return {"items": store.list_settlements(region, limit, offset, status)}
 
 
 @app.get("/api/settlements/{sid}")
 def get_settlement(sid: str, store: Store = Depends(get_store)):
-    """结算单详情：来源单号、来源版本原扣费、与上次结算的差额及合计。"""
+    """结算单详情：来源单号、来源版本原扣费、与上次结算的差额、合计，
+    以及冲正状态与冲正单关联（未冲正时 status=active、reversed_by=null）。"""
     rec = store.get_settlement(sid)
     if not rec:
         return _err([{"field": "id", "message": f"结算单不存在：{sid}"}], 404)
+    return rec
+
+
+# ---------------------------------------------------------------- 结算冲正
+@app.post("/api/settlements/{sid}/reversal", status_code=201)
+def reverse_settlement(sid: str, payload: ReversalIn,
+                       store: Store = Depends(get_store)):
+    """冲正整张选错批次的结算单（红冲）。
+
+    财务凭原结算单号、唯一幂等请求号、冲正原因与操作者发起；系统在单个
+    持锁事务内核对原单涉及的每条修订链都不存在更晚的有效结算，随后生成
+    **关联原单、逐项金额相反的独立冲正记录**，原结算单、明细及既有审计
+    保持原样（原单仅补记冲正关联与状态）。任一链受阻则整单拒绝并在
+    blocked_chains 中指出受阻链及其更晚结算单。
+    同一请求号与相同内容重试返回同一冲正结果（200）；内容不同或换号
+    重复冲正一律拒绝，不会重复入账。"""
+    rec, created, err = store.create_reversal(
+        settlement_id=sid, request_id=payload.request_id,
+        reason=payload.reason, operator=payload.operator,
+        content_hash=_reversal_hash(sid, payload.reason, payload.operator))
+    if err:
+        return _err(err["errors"], err["status"])
+    if not created:
+        # 同一请求号 + 相同内容：返回原冲正单，不重复入账、不重复审计
+        return JSONResponse(status_code=200, content=rec)
+    store.add_audit(payload.operator, "settlement.reversed", "settlement",
+                    rec["id"],
+                    {"request_id": payload.request_id,
+                     "settlement_id": sid,
+                     "region": rec["region"],
+                     "currency": rec["currency"],
+                     "total_delta": rec["total_delta"],
+                     "reason": payload.reason,
+                     "items": [{"assessment_id": it["assessment_id"],
+                                "original_fee": it["original_fee"],
+                                "source_delta": it["source_delta"],
+                                "delta": it["delta"]}
+                               for it in rec["items"]]})
+    return rec
+
+
+@app.get("/api/reversals")
+def list_reversals(region: str | None = None, limit: int = 50, offset: int = 0,
+                   store: Store = Depends(get_store)):
+    """冲正单列表：含原结算单关联、冲正合计（原单合计的相反数）。"""
+    limit = max(1, min(limit, 500))
+    return {"items": store.list_reversals(region, limit, offset)}
+
+
+@app.get("/api/reversals/{rid}")
+def get_reversal(rid: str, store: Store = Depends(get_store)):
+    """冲正单详情：原结算单号、逐项来源金额与相反金额、原因与操作者。"""
+    rec = store.get_reversal(rid)
+    if not rec:
+        return _err([{"field": "id", "message": f"冲正单不存在：{rid}"}], 404)
     return rec
 
 
