@@ -873,6 +873,295 @@ def test_settlement_failure_no_side_effects(client):
     assert actions.count("settlement.created") == 1
 
 
+# ------------------------------------------------------------------ 结算冲正
+def reverse(client, sid, **kw):
+    payload = {"request_id": "REV-0001", "reason": "选错批次，整单冲正",
+               "operator": "财务-王五"}
+    payload.update(kw)
+    return client.post(f"/api/settlements/{sid}/reversals", json=payload)
+
+
+def test_reversal_ok_original_and_audit_unchanged(client):
+    a1 = create_one(client)                                   # 扣费 3.6
+    a2 = create_one(client, batch_no="B002",
+                    materials=[{"category": "纸类",
+                                "contamination_kg": 5}])      # 扣费 3.0
+    s1 = settle(client, [a1["id"], a2["id"]], request_id="REQ-R1").json()
+    assert s1["total_delta"] == 6.6
+    before_audit = client.get("/api/audit").json()["items"]
+
+    r = reverse(client, s1["id"])
+    assert r.status_code == 201, r.text
+    rev = r.json()
+    # 独立冲正记录：关联原单、逐项金额相反
+    assert rev["id"] != s1["id"]
+    assert rev["kind"] == "reversal"
+    assert rev["status"] == "active"
+    assert rev["reversal_of"] == s1["id"]
+    assert rev["reversed_by"] is None
+    assert rev["reason"] == "选错批次，整单冲正"
+    assert rev["operator"] == "财务-王五"
+    assert rev["request_id"] == "REV-0001"
+    assert rev["region"] == "default"
+    assert rev["currency"] == "CNY"
+    assert rev["total_delta"] == -6.6
+    assert len(rev["items"]) == 2
+    by_aid = {it["assessment_id"]: it for it in rev["items"]}
+    assert by_aid[a1["id"]]["delta"] == -3.6
+    assert by_aid[a2["id"]]["delta"] == -3.0
+    # 来源版本与基线信息沿用原明细
+    assert by_aid[a1["id"]]["original_fee"] == 3.6
+    assert by_aid[a1["id"]]["prev_settled_id"] is None
+
+    # 原结算单与明细保持原样，仅状态与冲正关联可见
+    old = client.get(f"/api/settlements/{s1['id']}").json()
+    assert old["kind"] == "normal"
+    assert old["status"] == "reversed"
+    assert old["reversed_by"] == rev["id"]
+    assert old["reversal_of"] is None
+    assert old["total_delta"] == 6.6
+    assert {it["assessment_id"]: it["delta"] for it in old["items"]} == \
+        {a1["id"]: 3.6, a2["id"]: 3.0}
+
+    # 列表同样呈现冲正关联及状态，既有字段含义不变
+    lst = {s["id"]: s for s in client.get("/api/settlements").json()["items"]}
+    assert lst[s1["id"]]["status"] == "reversed"
+    assert lst[s1["id"]]["reversed_by"] == rev["id"]
+    assert lst[s1["id"]]["item_count"] == 2
+    assert lst[rev["id"]]["kind"] == "reversal"
+    assert lst[rev["id"]]["reversal_of"] == s1["id"]
+    assert lst[rev["id"]]["total_delta"] == -6.6
+
+    # 审计：新增一条 settlement.reversed，既有审计保持原样
+    after_audit = client.get("/api/audit").json()["items"]
+    assert len(after_audit) == len(before_audit) + 1
+    rec = [i for i in after_audit if i["action"] == "settlement.reversed"]
+    assert len(rec) == 1
+    assert rec[0]["actor"] == "财务-王五"
+    assert rec[0]["entity_id"] == rev["id"]
+    import json as _json
+    detail = _json.loads(rec[0]["detail"])
+    assert detail["reversal_of"] == s1["id"]
+    assert detail["request_id"] == "REV-0001"
+    assert detail["reason"] == "选错批次，整单冲正"
+    assert detail["total_delta"] == -6.6
+
+
+def test_reversal_blocked_by_later_settlement(client):
+    a1 = create_one(client)                                   # 扣费 3.6
+    s1 = settle(client, [a1["id"]], request_id="REQ-B1").json()
+    # 修订后再次结算：链上存在更晚的有效结算
+    a2 = client.post(f"/api/assessments/{a1['id']}/revisions",
+                     json=revise_payload(a1["id"])).json()    # 扣费 0
+    s2 = settle(client, [a2["id"]], request_id="REQ-B2").json()
+    assert s2["total_delta"] == -3.6
+
+    # 冲正较早的 s1：整单拒绝并指出受阻链与更晚结算
+    r = reverse(client, s1["id"])
+    assert r.status_code == 409
+    msg = r.json()["errors"][0]["message"]
+    assert a1["id"] in msg and s2["id"] in msg
+    assert "更晚" in msg
+    # 未产生任何冲正记录与审计
+    assert len(client.get("/api/settlements").json()["items"]) == 2
+    actions = [i["action"] for i in client.get("/api/audit").json()["items"]]
+    assert "settlement.reversed" not in actions
+
+    # 按逆序先冲正更晚的 s2，再冲正 s1：均可成功
+    assert reverse(client, s2["id"], request_id="REV-B2").status_code == 201
+    assert reverse(client, s1["id"], request_id="REV-B1").status_code == 201
+    lst = {s["id"]: s for s in client.get("/api/settlements").json()["items"]}
+    assert lst[s1["id"]]["status"] == "reversed"
+    assert lst[s2["id"]]["status"] == "reversed"
+
+
+def test_reversal_idempotent_replay_and_no_double_post(client):
+    a1 = create_one(client)
+    s1 = settle(client, [a1["id"]], request_id="REQ-I").json()
+    r1 = reverse(client, s1["id"], request_id="REV-I")
+    assert r1.status_code == 201
+    before_audit = len(client.get("/api/audit").json()["items"])
+
+    # 同一请求号 + 相同内容：返回同一冲正结果，不重复入账、不重复审计
+    r2 = reverse(client, s1["id"], request_id="REV-I")
+    assert r2.status_code == 200
+    assert r2.json()["id"] == r1.json()["id"]
+    assert r2.json()["total_delta"] == -3.6
+    assert len(client.get("/api/audit").json()["items"]) == before_audit
+
+    # 同一请求号但内容不同：冲突
+    r3 = reverse(client, s1["id"], request_id="REV-I", reason="换个原因")
+    assert r3.status_code == 409
+    assert "request_id" in fields(r3)
+
+    # 换号重复冲正同一结算单：拒绝，不得重复入账
+    r4 = reverse(client, s1["id"], request_id="REV-I2")
+    assert r4.status_code == 409
+    assert "已被冲正" in r4.json()["errors"][0]["message"]
+
+    # 仍然只有一张冲正记录、一条冲正审计
+    lst = client.get("/api/settlements").json()["items"]
+    assert sum(1 for s in lst if s["kind"] == "reversal") == 1
+    actions = [i["action"] for i in client.get("/api/audit").json()["items"]]
+    assert actions.count("settlement.reversed") == 1
+
+
+def test_reversal_not_found_and_missing_fields(client):
+    r = reverse(client, "NOPE")
+    assert r.status_code == 404
+    assert "id" in fields(r)
+    a1 = create_one(client)
+    s1 = settle(client, [a1["id"]], request_id="REQ-M").json()
+    for body in ({"request_id": "REV-M", "reason": "x"},          # 缺 operator
+                 {"request_id": "REV-M", "operator": "y"},        # 缺 reason
+                 {"request_id": "", "reason": "x", "operator": "y"}):
+        r = client.post(f"/api/settlements/{s1['id']}/reversals", json=body)
+        assert r.status_code == 422, body
+    # 失败不产生冲正记录与审计，也不占用请求号
+    assert len(client.get("/api/settlements").json()["items"]) == 1
+    actions = [i["action"] for i in client.get("/api/audit").json()["items"]]
+    assert "settlement.reversed" not in actions
+    assert reverse(client, s1["id"], request_id="REV-M").status_code == 201
+
+
+def test_reversal_of_reversal_rejected(client):
+    a1 = create_one(client)
+    s1 = settle(client, [a1["id"]], request_id="REQ-RR").json()
+    rev = reverse(client, s1["id"]).json()
+    # 冲正记录本身不能再被冲正
+    r = reverse(client, rev["id"], request_id="REV-RR2")
+    assert r.status_code == 409
+    assert "冲正记录" in r.json()["errors"][0]["message"]
+    lst = client.get("/api/settlements").json()["items"]
+    assert sum(1 for s in lst if s["kind"] == "reversal") == 1
+
+
+def test_settle_after_reversal_baseline_from_zero(client):
+    a1 = create_one(client)                                   # 扣费 3.6
+    s1 = settle(client, [a1["id"]], request_id="REQ-Z1").json()
+    assert reverse(client, s1["id"], request_id="REV-Z1").status_code == 201
+
+    # 冲正后再结算：没有更早的有效结算，从零起算；允许原版本重新结算
+    r = settle(client, [a1["id"]], request_id="REQ-Z2")
+    assert r.status_code == 201, r.text
+    s2 = r.json()
+    assert s2["items"][0]["assessment_id"] == a1["id"]
+    assert s2["items"][0]["prev_settled_id"] is None
+    assert s2["items"][0]["prev_fee"] is None
+    assert s2["items"][0]["delta"] == 3.6
+    # 原结算单保持已冲正状态，不被新结算改写
+    old = client.get(f"/api/settlements/{s1['id']}").json()
+    assert old["status"] == "reversed"
+    assert old["total_delta"] == 3.6
+
+
+def test_settle_after_reversal_baseline_prev_valid(client):
+    a1 = create_one(client)                                   # 扣费 3.6
+    s1 = settle(client, [a1["id"]], request_id="REQ-P1").json()
+    a2 = client.post(f"/api/assessments/{a1['id']}/revisions",
+                     json=revise_payload(a1["id"])).json()    # 扣费 0
+    s2 = settle(client, [a2["id"]], request_id="REQ-P2").json()
+    assert s2["items"][0]["delta"] == -3.6
+
+    # 冲正 s2 后，差额基线回到冲正前上一笔有效结算（s1 入账的 v1）
+    assert reverse(client, s2["id"], request_id="REV-P2").status_code == 201
+    a3 = client.post(f"/api/assessments/{a1['id']}/revisions",
+                     json=revise_payload(a2["id"], weight_kg=100,
+                                         materials=[{"category": "PET",
+                                                     "contamination_kg": 6}]
+                                         )).json()
+    assert a3["total_fee"] == 7.2
+    s3 = settle(client, [a3["id"]], request_id="REQ-P3").json()
+    assert s3["items"][0]["prev_settled_id"] == a1["id"]
+    assert s3["items"][0]["prev_fee"] == 3.6
+    assert s3["items"][0]["delta"] == 3.6                     # 7.2 - 3.6
+
+    # 冲正 s2 后也允许按原版本（链尾 v2）重新结算，基线同样是 v1
+    # （先冲正 s3 腾出链尾版本）
+    assert reverse(client, s3["id"], request_id="REV-P3").status_code == 201
+    s4 = settle(client, [a3["id"]], request_id="REQ-P4").json()
+    assert s4["items"][0]["prev_settled_id"] == a1["id"]
+    assert s4["items"][0]["delta"] == 3.6
+
+
+def test_reversal_concurrent_single_winner(client):
+    import concurrent.futures
+
+    a1 = create_one(client)
+    s1 = settle(client, [a1["id"]], request_id="REQ-C").json()
+
+    def fire(i):
+        return reverse(client, s1["id"], request_id=f"REV-C{i}")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        codes = [f.result().status_code for f in
+                 [pool.submit(fire, i) for i in range(4)]]
+    assert codes.count(201) == 1
+    assert codes.count(409) == 3
+    lst = client.get("/api/settlements").json()["items"]
+    assert sum(1 for s in lst if s["kind"] == "reversal") == 1
+    actions = [i["action"] for i in client.get("/api/audit").json()["items"]]
+    assert actions.count("settlement.reversed") == 1
+
+
+def test_reversal_and_settlement_concurrent_consistent(client):
+    import concurrent.futures
+
+    a1 = create_one(client)                                   # 扣费 3.6
+    s1 = settle(client, [a1["id"]], request_id="REQ-D1").json()
+    a2 = client.post(f"/api/assessments/{a1['id']}/revisions",
+                     json=revise_payload(a1["id"])).json()    # 扣费 0
+
+    # 并发：冲正 s1 与结算新链尾 a2 —— 两种串行结果都须账目一致
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        fut_rev = pool.submit(reverse, client, s1["id"], request_id="REV-D1")
+        fut_set = pool.submit(settle, client, [a2["id"]], request_id="REQ-D2")
+        rev_resp, set_resp = fut_rev.result(), fut_set.result()
+
+    assert set_resp.status_code == 201
+    item = set_resp.json()["items"][0]
+    if rev_resp.status_code == 201:
+        # 冲正先完成：再结算没有有效基线，从零起算
+        assert item["prev_settled_id"] is None
+        assert item["delta"] == 0
+    else:
+        # 结算先完成：冲正被更晚结算阻塞
+        assert rev_resp.status_code == 409
+        assert item["prev_settled_id"] == a1["id"]
+        assert item["delta"] == -3.6
+    # 账目一致：有效普通结算合计 == 链尾当前扣费（0）
+    lst = client.get("/api/settlements").json()["items"]
+    active_normal = [s for s in lst
+                     if s["kind"] == "normal" and s["status"] == "active"]
+    assert round(sum(s["total_delta"] for s in active_normal), 2) == 0
+    # 冲正记录与原单状态关联一致
+    by_id = {s["id"]: s for s in lst}
+    if rev_resp.status_code == 201:
+        assert by_id[s1["id"]]["status"] == "reversed"
+        assert by_id[s1["id"]]["reversed_by"] == rev_resp.json()["id"]
+    else:
+        assert by_id[s1["id"]]["status"] == "active"
+
+
+def test_reversal_query_fields_compatible(client):
+    a1 = create_one(client)
+    s1 = settle(client, [a1["id"]], request_id="REQ-Q").json()
+    rev = reverse(client, s1["id"], request_id="REV-Q").json()
+    for rec in (client.get(f"/api/settlements/{s1['id']}").json(),
+                client.get(f"/api/settlements/{rev['id']}").json()):
+        # 既有字段保持，新增冲正关联字段
+        for f in ("id", "request_id", "region", "currency", "total_delta",
+                  "operator", "created_at", "items"):
+            assert f in rec
+        for f in ("kind", "status", "reversal_of", "reversed_by", "reason"):
+            assert f in rec
+    for it in client.get("/api/settlements").json()["items"]:
+        for f in ("id", "request_id", "region", "currency", "total_delta",
+                  "operator", "created_at", "item_count",
+                  "kind", "status", "reversal_of", "reversed_by", "reason"):
+            assert f in it
+
+
 # ------------------------------------------------------------------ 拒收复投
 def rejected_payload(**kw):
     base = {

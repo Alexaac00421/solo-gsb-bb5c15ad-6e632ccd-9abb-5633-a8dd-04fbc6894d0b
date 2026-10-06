@@ -87,6 +87,13 @@ class SettlementIn(BaseModel):
     operator: str | None = Field(default=None, max_length=32)
 
 
+class ReversalIn(BaseModel):
+    """冲正提交：唯一请求号、原因与操作者；原结算单号取自路径。"""
+    request_id: str = Field(min_length=1, max_length=64)
+    reason: str = Field(min_length=1, max_length=200)
+    operator: str = Field(min_length=1, max_length=32)
+
+
 # ------------------------------------------------------------------ 错误处理
 def _err(errors: list[dict], status: int = 422) -> JSONResponse:
     return JSONResponse(status_code=status, content={"errors": errors})
@@ -518,10 +525,51 @@ def list_settlements(region: str | None = None, limit: int = 50, offset: int = 0
 
 @app.get("/api/settlements/{sid}")
 def get_settlement(sid: str, store: Store = Depends(get_store)):
-    """结算单详情：来源单号、来源版本原扣费、与上次结算的差额及合计。"""
+    """结算单详情：来源单号、来源版本原扣费、与上次结算的差额及合计；
+    附冲正关联与状态（kind / status / reversal_of / reversed_by / reason）。"""
     rec = store.get_settlement(sid)
     if not rec:
         return _err([{"field": "id", "message": f"结算单不存在：{sid}"}], 404)
+    return rec
+
+
+def _reversal_hash(settlement_id: str, reason: str, operator: str | None) -> str:
+    """冲正请求内容指纹：同一幂等请求号重试时用于比对内容是否一致。"""
+    canon = {"settlement_id": settlement_id, "reason": reason,
+             "operator": operator}
+    return hashlib.sha256(
+        json.dumps(canon, ensure_ascii=False, sort_keys=True).encode()
+    ).hexdigest()
+
+
+@app.post("/api/settlements/{sid}/reversals", status_code=201)
+def create_reversal(sid: str, payload: ReversalIn,
+                    store: Store = Depends(get_store)):
+    """冲正整张结算单：凭原结算单号、唯一请求号、原因与操作者，
+    生成关联原单、逐项金额相反的独立冲正记录；原结算单、明细及
+    既有审计保持原样。仅当原单涉及的每条修订链都没有更晚的有效
+    结算时才可冲正，否则整单拒绝并指出受阻链。同一请求号与相同
+    内容重试返回原冲正记录；内容不同或换号重复冲正报 409。"""
+    rec, created, err = store.create_reversal(
+        settlement_id=sid, request_id=payload.request_id,
+        reason=payload.reason, operator=payload.operator,
+        content_hash=_reversal_hash(sid, payload.reason, payload.operator))
+    if err:
+        return _err(err["errors"], err["status"])
+    if not created:
+        # 同一请求号 + 相同内容：返回原冲正记录，不重复入账、不重复审计
+        return JSONResponse(status_code=200, content=rec)
+    store.add_audit(payload.operator, "settlement.reversed", "settlement",
+                    rec["id"],
+                    {"request_id": payload.request_id,
+                     "reversal_of": sid,
+                     "region": rec["region"],
+                     "currency": rec["currency"],
+                     "total_delta": rec["total_delta"],
+                     "reason": payload.reason,
+                     "items": [{"assessment_id": it["assessment_id"],
+                                "delta": it["delta"]}
+                               for it in rec["items"]]})
     return rec
 
 
